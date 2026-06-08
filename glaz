@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+import os, sys, time, socket
+
+R = '\033[91m'; G = '\033[92m'; Y = '\033[93m'; C = '\033[96m'
+N = '\033[0m'; BOLD = '\033[1m'; DIM = '\033[2m'
+ALT = '\033[?1049h'; NORM = '\033[?1049l'
+
+REFRESH = 2; NPROC = 8; SORT = 'rss'; REVERSE = False
+
+cfg = os.path.expanduser('~/.config/resmon/config')
+if os.path.isfile(cfg):
+    for line in open(cfg):
+        line = line.strip()
+        if '=' in line and not line.startswith('#'):
+            k, v = line.split('=', 1)
+            k = k.strip().upper(); v = v.strip()
+            if k == 'REFRESH': REFRESH = int(v)
+            elif k == 'NPROC': NPROC = int(v)
+            elif k == 'SORT' and v in ('rss', 'cpu'): SORT = v
+
+if '-c' in sys.argv: SORT = 'cpu'
+if '-r' in sys.argv: REVERSE = True
+try:
+    idx = sys.argv.index('-n')
+    NPROC = int(sys.argv[idx + 1])
+except (ValueError, IndexError):
+    pass
+
+CLK = os.sysconf(os.sysconf_names['SC_CLK_TCK'])
+
+
+def read_cpu():
+    with open('/proc/stat') as f:
+        parts = [int(x) for x in f.readline().strip().split()[1:]]
+    return sum(parts), parts[3]
+
+def cpu_percent(prev, cur):
+    td = cur[0] - prev[0]; id_ = cur[1] - prev[1]
+    return 100.0 * (td - id_) / td if td else 0
+
+def read_cpus():
+    cpus = {}
+    with open('/proc/stat') as f:
+        for line in f:
+            if line.startswith('cpu') and not line.startswith('cpu '):
+                parts = [int(x) for x in line.strip().split()[1:]]
+                cpus[line.split()[0]] = (sum(parts), parts[3])
+    return cpus
+
+def cpu_temp():
+    try:
+        temps = []
+        for e in sorted(os.listdir('/sys/class/thermal')):
+            if not e.startswith('thermal_zone'): continue
+            with open(f'/sys/class/thermal/{e}/temp') as f:
+                temps.append(int(f.read().strip()) / 1000)
+        return max(temps) if temps else None
+    except:
+        return None
+
+def cpu_freq():
+    try:
+        v = open('/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq').read().strip()
+        return f"{int(v) / 1000:.0f} MHz"
+    except:
+        return None
+
+def uptime_load():
+    with open('/proc/uptime') as f:
+        up = float(f.readline().split()[0])
+    days, rem = divmod(int(up), 86400)
+    hrs, rem = divmod(rem, 3600); mins, _ = divmod(rem, 60)
+    with open('/proc/loadavg') as f:
+        parts = f.read().split()
+    return f"{days}д {hrs}ч {mins}м", parts[0]
+
+def host_info():
+    host = open('/proc/sys/kernel/hostname').read().strip()
+    ver = open('/proc/sys/kernel/osrelease').read().strip()
+    return host, ver
+
+def get_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(2)
+        s.connect(("1.1.1.1", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except:
+        return None
+
+
+def mem_info():
+    with open('/proc/meminfo') as f:
+        d = {}
+        for line in f:
+            k, v = line.split(':'); d[k.strip()] = int(v.strip().split()[0])
+    t = d['MemTotal']
+    a = d.get('MemAvailable', d['MemFree'] + d['Buffers'] + d['Cached'])
+    st = d['SwapTotal']; su = st - d['SwapFree']
+    return t/1024, (t-a)/1024, a/1024, st/1024, su/1024
+
+
+def disk_usage():
+    parts = []
+    for e in os.listdir('/sys/block'):
+        if not e.startswith(('sd', 'nvme', 'vd', 'mmcblk')):
+            continue
+        for line in open('/proc/mounts'):
+            dev, mnt = line.split()[:2]
+            if dev.startswith(f'/dev/{e}'):
+                try:
+                    s = os.statvfs(mnt)
+                    t = s.f_frsize * s.f_blocks
+                    u = t - s.f_frsize * s.f_bfree
+                    parts.append((e, mnt, t, u))
+                except:
+                    pass
+                break
+    return parts
+
+def disk_model(name):
+    try:
+        with open(f'/sys/block/{name}/device/model') as f:
+            return f.read().strip()
+    except:
+        return ''
+
+def disk_io(prev):
+    rx, wx = 0, 0
+    for line in open('/proc/diskstats'):
+        cols = line.strip().split()
+        if len(cols) < 14: continue
+        name = cols[2]
+        if not name.startswith(('sd', 'nvme', 'vd', 'mmcblk')):
+            continue
+        if name[-1].isdigit() or 'p' in name[-3:]:
+            rx += int(cols[5]) * 512
+            wx += int(cols[9]) * 512
+    if prev is None:
+        return (rx, wx), (0, 0)
+    return (rx, wx), (rx - prev[0], wx - prev[1])
+
+
+def net_speed(prev):
+    rx, tx = 0, 0
+    for line in open('/proc/net/dev'):
+        if ':' not in line: continue
+        iface, data = line.split(':')
+        iface = iface.strip()
+        if iface == 'lo': continue
+        cols = data.split()
+        rx += int(cols[0]); tx += int(cols[8])
+    if prev is None:
+        return (rx, tx), (0, 0)
+    return (rx, tx), (rx - prev[0], tx - prev[1])
+
+
+def gpu_info():
+    try:
+        out = os.popen('nvidia-smi --query-gpu=utilization.gpu,temperature.gpu --format=csv,noheader,nounits 2>/dev/null').read().strip()
+        if out:
+            parts = out.split('\n')[0].split(',')
+            return int(parts[0].strip()), int(parts[1].strip())
+    except:
+        pass
+    for e in sorted(os.listdir('/sys/class/drm')):
+        if not e.startswith('card'): continue
+        p = f'/sys/class/drm/{e}/device/gpu_busy_percent'
+        if os.path.isfile(p):
+            try:
+                return int(open(p).read().strip()), None
+            except:
+                pass
+    return None, None
+
+
+def battery_info():
+    for bat in ('BAT0', 'BAT1', 'BAT1'):
+        base = f'/sys/class/power_supply/{bat}'
+        if os.path.isdir(base):
+            try:
+                cap = int(open(f'{base}/capacity').read().strip())
+                status = open(f'{base}/status').read().strip()
+                try:
+                    pwr = int(open(f'{base}/power_now').read().strip()) / 1_000_000
+                except:
+                    pwr = None
+                return cap, status, pwr
+            except:
+                pass
+    return None, None, None
+
+
+def proc_count():
+    total = 0; user = 0; zombies = 0; uid = os.getuid()
+    for pid in os.listdir('/proc'):
+        if not pid.isdigit(): continue
+        total += 1
+        try:
+            if os.stat(f'/proc/{pid}').st_uid == uid:
+                user += 1
+        except:
+            pass
+        try:
+            with open(f'/proc/{pid}/status') as f:
+                for line in f:
+                    if line.startswith('State'):
+                        state = line.split()[1][0] if len(line.split()) > 1 else '?'
+                        if state == 'Z': zombies += 1
+                        break
+        except:
+            pass
+    return total, user, zombies
+
+
+def top_procs(n=10):
+    procs = []
+    uptime = float(open('/proc/uptime').read().split()[0])
+    for pid in os.listdir('/proc'):
+        if not pid.isdigit(): continue
+        try:
+            with open(f'/proc/{pid}/status') as f:
+                s = {}
+                for line in f:
+                    k, _, v = line.partition('\t')
+                    s[k.rstrip(':')] = v.strip()
+            cmd = open(f'/proc/{pid}/cmdline', 'rb').read()
+            cmd = cmd.replace(b'\x00', b' ').decode('utf-8', errors='replace').strip()
+            if not cmd:
+                cmd = s.get('Name', '')
+            vm = int(s.get('VmRSS', '0').replace(' kB', ''))
+            state = s.get('State', '?')[0] if s.get('State') else '?'
+
+            with open(f'/proc/{pid}/stat') as f:
+                st = f.read()
+            rp = st.rindex(')')
+            rest = st[rp + 2:].split()
+            utime = int(rest[11]); stime = int(rest[12])
+            starttime = int(rest[19])
+            total_jiffies = utime + stime
+            elapsed = uptime - starttime / CLK
+            cpu_pct = total_jiffies / CLK / elapsed * 100 if elapsed > 0 else 0
+            thr = int(rest[17])
+            ni = int(rest[16])
+
+            procs.append((int(pid), vm, state, cmd, cpu_pct, thr, ni))
+        except (FileNotFoundError, PermissionError, ValueError, IndexError):
+            continue
+
+    key_idx = 4 if SORT == 'cpu' else 1
+    rev = not REVERSE
+    procs.sort(key=lambda x: x[key_idx], reverse=rev)
+    return procs[:n]
+
+
+def bar(pct, w=20):
+    f = int(w * pct / 100)
+    c = R if pct > 80 else (Y if pct > 50 else G)
+    return c + '█' * f + '░' * (w - f) + N
+
+def color_val(val, pct):
+    c = R if pct > 80 else (Y if pct > 50 else G)
+    return f"{c}{val}{N}"
+
+def fmt_size(b):
+    for u in ('B', 'KiB', 'MiB', 'GiB'):
+        if abs(b) < 1024:
+            return f"{b:.1f} {u}"
+        b /= 1024
+    return f"{b:.1f} TiB"
+
+
+def main():
+    cpu_p = read_cpu()
+    cpus_p = read_cpus()
+    net_p = None; disk_p = None
+    host, ver = host_info()
+    ip = get_ip()
+    sys.stdout.write(ALT)
+    try:
+        while True:
+            sys.stdout.write('\033[H\033[J')
+            t0 = time.time()
+
+            cpu_c = read_cpu(); cpu = cpu_percent(cpu_p, cpu_c); cpu_p = cpu_c
+            mt, mu, _, st, su = mem_info(); mp = 100 * mu / mt; sp = 100 * su / st if st else 0
+            disks = disk_usage()
+            up, ld = uptime_load()
+            net_p, (dr, dt) = net_speed(net_p)
+            disk_p, (dr_d, dw_d) = disk_io(disk_p)
+            gpu_u, gpu_t = gpu_info()
+            bat_cap, bat_st, bat_pwr = battery_info()
+            delta = time.time() - t0
+
+            print(f"  ╔{'═'*74}╗")
+            print(f"  ║{BOLD}{'Eye of System':^{74}}{N}║")
+            print(f"  ╚{'═'*74}╝")
+            hdr = f"╔═══ {host}"
+            if ip: hdr += f" {ip}"
+            hdr += f" │ {ver} │ {up} │ нагрузка {ld} ═══╗"
+            pad = 76 - len(hdr) + 4
+            if pad > 0:
+                hdr = hdr[:-1] + '═' * pad + hdr[-1]
+            print(f"  {BOLD}{hdr}{N}\n")
+
+            temp = cpu_temp()
+            freq = cpu_freq()
+            cpu_line = f"  {BOLD}ПРОЦЕССОР{N}  {color_val(f'{cpu:5.1f}%', cpu)}"
+            if freq:
+                cpu_line += f"  {DIM}{freq}{N}"
+            if temp is not None:
+                tc = G if temp < 60 else (Y if temp < 80 else R)
+                cpu_line += f"  │  {tc}{temp:.0f}°C{N}"
+            if gpu_u is not None:
+                gc = G if gpu_u < 50 else (Y if gpu_u < 80 else R)
+                cpu_line += f"  │  GPU {gc}{gpu_u}%{N}"
+                if gpu_t is not None:
+                    gt = G if gpu_t < 70 else (Y if gpu_t < 85 else R)
+                    cpu_line += f"  {gt}{gpu_t}°C{N}"
+            print(cpu_line)
+            print(f"  {bar(cpu)}\n")
+
+            cpus_c = read_cpus()
+            core_bars = []
+            for name in sorted(cpus_c):
+                if name in cpus_p:
+                    p = cpu_percent(cpus_p[name], cpus_c[name])
+                    core_bars.append((name, p))
+            cpus_p = cpus_c
+            if core_bars:
+                out = [f"  {'─'*15} ЯДРА {'─'*15}"]
+                for i in range(0, len(core_bars), 2):
+                    n1, v1 = core_bars[i]
+                    if i + 1 < len(core_bars):
+                        n2, v2 = core_bars[i + 1]
+                        out.append(f"  {n1:<5} {bar(v1, 10)}  {n2:<5} {bar(v2, 10)}")
+                    else:
+                        out.append(f"  {n1:<5} {bar(v1, 10)}")
+                print('\n'.join(out) + '\n')
+
+            if bat_cap is not None:
+                bc = G if bat_cap > 50 else (Y if bat_cap > 20 else R)
+                st_ru = {'Charging': 'Зарядка', 'Discharging': 'Разрядка', 'Full': 'Полный'}.get(bat_st, bat_st)
+                bat_line = f"  {BOLD}БАТАРЕЯ{N}  {bc}{bat_cap}%{N} ({st_ru}"
+                if bat_pwr is not None:
+                    bat_line += f", {bat_pwr:.1f} Вт"
+                bat_line += ")"
+                print(bat_line + '\n')
+
+            mem_line = f"  {BOLD}ПАМЯТЬ{N}  {color_val(f'{mu:6.0f} MiB', mp)} / {mt:6.0f} MiB  ({mp:.1f}%)"
+            if st:
+                mem_line += f"  │  {BOLD}ПОДКАЧКА{N}  {color_val(f'{su:6.0f} MiB', sp)} / {st:6.0f} MiB  ({sp:.1f}%)"
+            print(mem_line)
+            mem_bar = f"  {bar(mp)}"
+            if st:
+                mem_bar += f"  │  {bar(sp)}"
+            print(mem_bar + '\n')
+
+            if disks:
+                for name, mnt, dtot, du in disks:
+                    dp = 100 * du / dtot
+                    model = disk_model(name)
+                    dlabel = f"{name} ({mnt})"
+                    if model: dlabel += f" {DIM}{model}{N}"
+                    print(f"  {BOLD}ДИСК{N}  {dlabel}  {color_val(fmt_size(du), dp)} / {fmt_size(dtot)}  ({dp:.1f}%)")
+                    dbar = f"  {bar(dp)}"
+                    if dr_d is not None:
+                        dbar += f"  ┃  {DIM}чт{N} {fmt_size(dr_d/delta)}/с  {DIM}зап{N} {fmt_size(dw_d/delta)}/с"
+                    print(dbar + '\n')
+
+            print(f"  {BOLD}СЕТЬ{N}  ↓ {fmt_size(dr/delta)}/с  ↑ {fmt_size(dt/delta)}/с\n")
+
+            total_p, user_p, zombies = proc_count()
+            rev_sym = f" ↑" if REVERSE else f" ↓"
+            label = 'CPU' if SORT == 'cpu' else 'RSS'
+            pc = f"{total_p} всего, {user_p} ваших"
+            if zombies: pc += f", {R}{zombies} зомби{N}"
+            print(f"  {BOLD}ПРОЦЕССЫ{N}  {DIM}{pc}  ({label}{rev_sym}){N}")
+            print(f"  +{'─'*8}+{'─'*5}+{'─'*9}+{'─'*7}+{'─'*5}+{'─'*5}+{'─'*29}+")
+            print(f"  │ {'ID':>6} │ {'СТ':>3} │ {'RSS(КБ)':>7} │ {'%CPU':>5} │ {'ТНР':>3} │ {'NI':>3} │ {'КОМАНДА':<27} │")
+            print(f"  +{'─'*8}+{'─'*5}+{'─'*9}+{'─'*7}+{'─'*5}+{'─'*5}+{'─'*29}+")
+            for pid, rss, state, cmd, cpu_pct, thr, ni in top_procs(NPROC):
+                pct = 100 * rss / (mt * 1024) if mt else 0
+                sc = G if state == 'R' else (Y if state in ('S', 'D') else R)
+                cc = G if cpu_pct < 50 else (Y if cpu_pct < 90 else R)
+                nc = G if ni < 0 else (Y if ni > 0 else N)
+                print(f"  │ {pid:>6} │ {sc}{state:>3}{N} │ {color_val(f'{rss:>7}', pct)} │ {cc}{cpu_pct:5.1f}{N} │ {thr:>3} │ {nc}{ni:>3}{N} │ {cmd[:27]:<27} │")
+            print(f"  +{'─'*8}+{'─'*5}+{'─'*9}+{'─'*7}+{'─'*5}+{'─'*5}+{'─'*29}+")
+
+            time.sleep(REFRESH)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write(NORM)
+        print(f"  {DIM}пока{N}")
+
+if __name__ == '__main__':
+    main()
